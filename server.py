@@ -476,12 +476,49 @@ async def list_tools() -> list[types.Tool]:
                     },
                 },
             },
-        )
+        ),
+        types.Tool(
+            name="add_slide_to_brief",
+            description=(
+                "Adds a new slide to an existing ReshapeX presentation. "
+                "Duplicates an existing slide of the same layout type, replaces all text "
+                "with the provided content, and appends it to the end of the presentation. "
+                "Use when the user wants to extend a presentation they already have."
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["presentation_url", "slide_type", "content"],
+                "properties": {
+                    "presentation_url": {"type": "string", "description": "Full Google Slides URL or presentation ID"},
+                    "slide_type": {
+                        "type": "string",
+                        "enum": ["cards", "items", "asks", "weeks"],
+                        "description": "Layout type of the slide to add",
+                    },
+                    "content": {
+                        "type": "object",
+                        "description": "Content for the new slide. Same schema as slide2/slide3/slide4/slide5 in create_reshapex_brief.",
+                        "required": ["section_label", "tagline", "sub_description"],
+                        "properties": {
+                            "section_label": {"type": "string"},
+                            "tagline": {"type": "string"},
+                            "sub_description": {"type": "string"},
+                            "cards": {"type": "array", "items": {"type": "object"}},
+                            "items": {"type": "array", "items": {"type": "object"}},
+                            "asks":  {"type": "array", "items": {"type": "object"}},
+                            "weeks": {"type": "array", "items": {"type": "object"}},
+                        },
+                    },
+                },
+            },
+        ),
     ]
 
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    if name == "add_slide_to_brief":
+        return await _handle_add_slide(arguments)
     if name != "create_reshapex_brief":
         raise ValueError(f"Unknown tool: {name}")
 
@@ -558,6 +595,116 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
     except Exception as e:
         return [types.TextContent(type="text", text=f"Error: {e}")]
+
+
+async def _handle_add_slide(arguments: dict) -> list[types.TextContent]:
+    pres_id = _extract_pres_id(arguments["presentation_url"])
+    slide_type = arguments["slide_type"]
+    content = arguments["content"]
+    url = f"https://docs.google.com/presentation/d/{pres_id}/edit"
+
+    try:
+        slides_svc, _ = get_services()
+
+        # 1. Get current structure
+        pres = slides_svc.presentations().get(presentationId=pres_id).execute()
+        slides = pres["slides"]
+
+        # 2. Find the best matching slide to duplicate
+        source_slide = None
+        for s in reversed(slides):  # prefer the last matching slide
+            if _detect_slide_type(s) == slide_type:
+                source_slide = s
+                break
+        if source_slide is None:
+            # Fallback: duplicate the last content slide (index -1 or -2 if cover is last)
+            source_slide = slides[-1] if len(slides) > 1 else slides[0]
+
+        # 3. Duplicate it (inserts right after original)
+        dup_result = slides_svc.presentations().batchUpdate(
+            presentationId=pres_id,
+            body={"requests": [{"duplicateObject": {"objectId": source_slide["objectId"]}}]},
+        ).execute()
+        new_slide_id = dup_result["replies"][0]["duplicateObject"]["objectId"]
+
+        # 4. Get updated structure to find new element IDs + move slide to end
+        pres2 = slides_svc.presentations().get(presentationId=pres_id).execute()
+        slides2 = pres2["slides"]
+        n = len(slides2)
+        new_slide = next(s for s in slides2 if s["objectId"] == new_slide_id)
+        new_pos = next(i for i, s in enumerate(slides2) if s["objectId"] == new_slide_id)
+
+        seq = TYPE_TO_SEQ[slide_type]
+        m = map_slide_elements(new_slide, seq)
+
+        # 5. Build requests: move to end + replace all text
+        slide_num = n  # after repositioning it'll be last
+        requests = []
+        if new_pos != n - 1:
+            requests.append({
+                "updateSlidesPosition": {
+                    "slideObjectIds": [new_slide_id],
+                    "insertionIndex": n - 1,
+                }
+            })
+        requests += TYPE_TO_BUILDER[slide_type](m, content, slide_num, n)
+
+        slides_svc.presentations().batchUpdate(
+            presentationId=pres_id,
+            body={"requests": requests},
+        ).execute()
+
+        return [types.TextContent(
+            type="text",
+            text=f"Slide added ({slide_type}, position {slide_num} of {n}).\n\nURL: {url}",
+        )]
+
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
+
+
+def _extract_pres_id(url_or_id: str) -> str:
+    """Extract presentation ID from a Google Slides URL or return as-is."""
+    if "presentation/d/" in url_or_id:
+        part = url_or_id.split("presentation/d/")[1]
+        return part.split("/")[0].split("?")[0]
+    return url_or_id.strip()
+
+
+def _detect_slide_type(slide: dict) -> str:
+    """Guess slide type by looking for distinctive text patterns."""
+    texts = set()
+    for el in slide.get("pageElements", []):
+        if "shape" in el and "text" in el["shape"]:
+            t = extract_text(el["shape"])
+            if t:
+                texts.add(t)
+    # Weeks: W1 / W2 labels
+    if any(t in ("W1", "W2") for t in texts):
+        return "weeks"
+    # Asks: numbered items 01–04
+    if any(t in ("01", "02", "03", "04") for t in texts):
+        return "asks"
+    # Items: single-char icon symbols with arrow source lines
+    if any(t.startswith("→") or t.startswith("->") for t in texts):
+        return "items"
+    # Default: cards
+    return "cards"
+
+
+TYPE_TO_SEQ = {
+    "cards": SLIDE_2_SEQ,
+    "items": SLIDE_3_SEQ,
+    "asks":  SLIDE_4_SEQ,
+    "weeks": SLIDE_5_SEQ,
+}
+
+TYPE_TO_BUILDER = {
+    "cards": build_slide2_requests,
+    "items": build_slide3_requests,
+    "asks":  build_slide4_requests,
+    "weeks": build_slide5_requests,
+}
 
 
 async def main():
